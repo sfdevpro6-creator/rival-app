@@ -371,8 +371,8 @@ export default function RivalApp() {
 
   // Friends & search
   const [friends, setFriends] = useState([]);
-  const [searchEmail, setSearchEmail] = useState("");
-  const [searchResult, setSearchResult] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
   const [searchError, setSearchError] = useState("");
 
   // Notifications
@@ -380,7 +380,7 @@ export default function RivalApp() {
 
   // Forms
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
-  const [signupForm, setSignupForm] = useState({ name: "", email: "", password: "", avatar: "🦊" });
+  const [signupForm, setSignupForm] = useState({ name: "", username: "", email: "", phone: "", password: "", avatar: "🦊" });
   const [authError, setAuthError] = useState("");
 
   // Invite
@@ -393,6 +393,10 @@ export default function RivalApp() {
     const l = document.createElement("link");
     l.href = "https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Outfit:wght@300;400;500;600;700&display=swap";
     l.rel = "stylesheet"; document.head.appendChild(l);
+    // Detect invite code from URL
+    const params = new URLSearchParams(window.location.search);
+    const invite = params.get("invite");
+    if (invite) { setInviteCode(invite); setScreen("signup"); }
   }, []);
 
   // ─── Auth listener ───
@@ -466,17 +470,48 @@ export default function RivalApp() {
   // ─── Auth handlers ───
   const handleSignup = async () => {
     setAuthError("");
+    if (!signupForm.username.trim()) { setAuthError("Username is required"); return; }
     try {
+      // Check username uniqueness
+      const usernameQ = query(collection(db, "users"), where("usernameLower", "==", signupForm.username.toLowerCase().trim()));
+      const usernameSnap = await getDocs(usernameQ);
+      if (!usernameSnap.empty) { setAuthError("Username already taken. Try another one."); return; }
+
       const cred = await createUserWithEmailAndPassword(auth, signupForm.email, signupForm.password);
+      const myInviteCode = generateInviteCode();
       await setDoc(doc(db, "users", cred.user.uid), {
-        name: signupForm.name || "Player",
+        name: signupForm.name || signupForm.username,
+        username: signupForm.username.trim(),
+        usernameLower: signupForm.username.toLowerCase().trim(),
         email: signupForm.email.toLowerCase(),
+        phone: signupForm.phone.replace(/\D/g, ""),
         avatar: signupForm.avatar,
         status: "online",
         friends: [],
         createdAt: serverTimestamp(),
-        inviteCode: generateInviteCode()
+        inviteCode: myInviteCode
       });
+
+      // If they signed up via invite link, auto-add the inviter as friend
+      if (inviteCode) {
+        const inviterQ = query(collection(db, "users"), where("inviteCode", "==", inviteCode));
+        const inviterSnap = await getDocs(inviterQ);
+        if (!inviterSnap.empty) {
+          const inviterUid = inviterSnap.docs[0].id;
+          const inviterData = inviterSnap.docs[0].data();
+          // Add each other as friends
+          await updateDoc(doc(db, "users", cred.user.uid), { friends: arrayUnion(inviterUid) });
+          await updateDoc(doc(db, "users", inviterUid), { friends: arrayUnion(cred.user.uid) });
+          // Notify the inviter
+          await addDoc(collection(db, "notifications"), {
+            to: inviterUid, from: cred.user.uid, fromName: signupForm.name || signupForm.username,
+            type: "friend_added", text: `${signupForm.name || signupForm.username} joined from your invite link!`,
+            read: false, createdAt: serverTimestamp()
+          });
+        }
+        // Clear invite from URL
+        window.history.replaceState({}, "", window.location.pathname);
+      }
     } catch (e) { setAuthError(e.message.replace("Firebase: ", "")); }
   };
 
@@ -491,16 +526,46 @@ export default function RivalApp() {
     await signOut(auth);
   };
 
-  // ─── Friend search by email ───
+  // ─── Friend search by username, email, or phone ───
   const searchForFriend = async () => {
-    setSearchResult(null); setSearchError("");
-    if (!searchEmail.trim()) return;
-    const q = query(collection(db, "users"), where("email", "==", searchEmail.toLowerCase().trim()));
-    const snap = await getDocs(q);
-    if (snap.empty) { setSearchError("No user found with that email"); return; }
-    const found = { uid: snap.docs[0].id, ...snap.docs[0].data() };
-    if (found.uid === authUser.uid) { setSearchError("That's you!"); return; }
-    setSearchResult(found);
+    setSearchResults([]); setSearchError("");
+    const q2 = searchQuery.trim();
+    if (!q2) return;
+    const results = [];
+    const seen = new Set();
+
+    try {
+      // Search by exact email
+      if (q2.includes("@")) {
+        const snap = await getDocs(query(collection(db, "users"), where("email", "==", q2.toLowerCase())));
+        snap.docs.forEach(d => { if (!seen.has(d.id)) { seen.add(d.id); results.push({ uid: d.id, ...d.data() }); } });
+      }
+
+      // Search by exact phone (strip non-digits)
+      const phoneDigits = q2.replace(/\D/g, "");
+      if (phoneDigits.length >= 7) {
+        const snap = await getDocs(query(collection(db, "users"), where("phone", "==", phoneDigits)));
+        snap.docs.forEach(d => { if (!seen.has(d.id)) { seen.add(d.id); results.push({ uid: d.id, ...d.data() }); } });
+      }
+
+      // Search by exact username (case-insensitive)
+      const snap2 = await getDocs(query(collection(db, "users"), where("usernameLower", "==", q2.toLowerCase())));
+      snap2.docs.forEach(d => { if (!seen.has(d.id)) { seen.add(d.id); results.push({ uid: d.id, ...d.data() }); } });
+
+      // Search by username prefix (for partial matches)
+      const lower = q2.toLowerCase();
+      const upperBound = lower.slice(0, -1) + String.fromCharCode(lower.charCodeAt(lower.length - 1) + 1);
+      const snap3 = await getDocs(query(collection(db, "users"), where("usernameLower", ">=", lower), where("usernameLower", "<", upperBound), limit(10)));
+      snap3.docs.forEach(d => { if (!seen.has(d.id)) { seen.add(d.id); results.push({ uid: d.id, ...d.data() }); } });
+
+      // Filter out self
+      const filtered = results.filter(r => r.uid !== authUser.uid);
+      if (filtered.length === 0) setSearchError("No users found. Try a different username, email, or phone number.");
+      setSearchResults(filtered);
+    } catch (e) {
+      console.error("Search error:", e);
+      setSearchError("Search error. Try again.");
+    }
   };
 
   const addFriend = async (friendUid) => {
@@ -513,7 +578,7 @@ export default function RivalApp() {
       read: false, createdAt: serverTimestamp()
     });
     setUserProfile(prev => ({ ...prev, friends: [...(prev.friends || []), friendUid] }));
-    setSearchResult(null); setSearchEmail("");
+    setSearchResults([]); setSearchQuery("");
   };
 
   // ─── Start conversation ───
@@ -673,10 +738,13 @@ export default function RivalApp() {
             <button key={a} onClick={() => setSignupForm(f => ({...f, avatar: a }))} style={{...S.btn,width:44,height:44,borderRadius:12,fontSize:22,background:signupForm.avatar === a ? "rgba(255,23,68,0.2)" : "rgba(255,255,255,0.04)",border:signupForm.avatar === a ? "2px solid #FF1744" : "1px solid rgba(255,255,255,0.08)",display:"flex",alignItems:"center",justifyContent:"center"}}>{a}</button>
           ))}</div>
         </div>
+        <input style={{...S.inp,marginBottom:12}} placeholder="Username (unique handle)" value={signupForm.username} onChange={e => setSignupForm(f => ({...f, username: e.target.value.replace(/\s/g, "") }))} />
         <input style={{...S.inp,marginBottom:12}} placeholder="Display Name" value={signupForm.name} onChange={e => setSignupForm(f => ({...f, name: e.target.value }))} />
+        <input style={{...S.inp,marginBottom:12}} placeholder="Phone Number" type="tel" value={signupForm.phone} onChange={e => setSignupForm(f => ({...f, phone: e.target.value }))} />
         <input style={{...S.inp,marginBottom:12}} placeholder="Email" type="email" value={signupForm.email} onChange={e => setSignupForm(f => ({...f, email: e.target.value }))} />
         <input style={{...S.inp,marginBottom:20}} placeholder="Password (min 6 chars)" type="password" value={signupForm.password} onChange={e => setSignupForm(f => ({...f, password: e.target.value }))} onKeyDown={e => { if (e.key === "Enter") handleSignup(); }} />
         <button onClick={handleSignup} style={{...S.btn,width:"100%",padding:"14px",borderRadius:14,background:"linear-gradient(135deg,#FF5722,#FF9100)",color:"#fff",fontSize:16,fontWeight:600,marginBottom:24}}>Create Account</button>
+        {inviteCode && <div style={{textAlign:"center",fontSize:12,color:"#22c55e",marginBottom:16}}>🔗 Signing up from invite code: <strong>{inviteCode}</strong></div>}
       </div>
     </div>
   );
@@ -738,22 +806,23 @@ export default function RivalApp() {
         <h2 style={{fontFamily:"'Orbitron',sans-serif",fontSize:18,fontWeight:700,margin:0}}>Add Friends</h2>
       </div>
       <div style={{padding:20,flex:1,overflowY:"auto"}}>
-        {/* Search by email */}
+        {/* Search */}
         <div style={{marginBottom:24}}>
-          <div style={{fontSize:12,color:"#94a3b8",marginBottom:8,fontWeight:600,letterSpacing:1,fontFamily:"'Orbitron',sans-serif"}}>SEARCH BY EMAIL</div>
+          <div style={{fontSize:12,color:"#94a3b8",marginBottom:8,fontWeight:600,letterSpacing:1,fontFamily:"'Orbitron',sans-serif"}}>FIND PLAYERS</div>
           <div style={{display:"flex",gap:8}}>
-            <input style={{...S.inp,flex:1}} placeholder="friend@email.com" value={searchEmail} onChange={e => setSearchEmail(e.target.value)} onKeyDown={e => { if (e.key === "Enter") searchForFriend(); }} />
+            <input style={{...S.inp,flex:1}} placeholder="Username, email, or phone..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} onKeyDown={e => { if (e.key === "Enter") searchForFriend(); }} />
             <button onClick={searchForFriend} style={{...S.btn,background:"linear-gradient(135deg,#D50000,#FF1744)",color:"#fff",padding:"0 20px",borderRadius:12,fontSize:14,fontWeight:600}}>Search</button>
           </div>
+          <div style={{fontSize:10,color:"#475569",marginTop:4}}>Search by username, email address, or phone number</div>
           {searchError && <div style={{color:"#ef4444",fontSize:13,marginTop:8}}>{searchError}</div>}
-          {searchResult && (
-            <div style={{marginTop:12,background:"rgba(255,255,255,0.04)",borderRadius:12,padding:16,display:"flex",alignItems:"center",gap:12}}>
-              <div style={{width:48,height:48,borderRadius:24,background:"linear-gradient(135deg,#D50000,#FF1744)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:24}}>{searchResult.avatar}</div>
-              <div style={{flex:1}}><div style={{fontWeight:600,fontSize:15}}>{searchResult.name}</div><div style={{fontSize:12,color:"#64748b"}}>{searchResult.email}</div></div>
-              {userProfile.friends?.includes(searchResult.uid) ? <div style={{color:"#22c55e",fontSize:12,fontWeight:600}}>✓ Friends</div> :
-                <button onClick={() => addFriend(searchResult.uid)} style={{...S.btn,background:"#22c55e",color:"#fff",padding:"8px 16px",borderRadius:10,fontSize:13,fontWeight:600}}>Add</button>}
+          {searchResults.map(r => (
+            <div key={r.uid} style={{marginTop:12,background:"rgba(255,255,255,0.04)",borderRadius:12,padding:16,display:"flex",alignItems:"center",gap:12}}>
+              <div style={{width:48,height:48,borderRadius:24,background:"linear-gradient(135deg,#D50000,#FF1744)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:24}}>{r.avatar}</div>
+              <div style={{flex:1}}><div style={{fontWeight:600,fontSize:15}}>{r.name}</div><div style={{fontSize:12,color:"#FF1744"}}>@{r.username||"user"}</div><div style={{fontSize:11,color:"#64748b"}}>{r.email}</div></div>
+              {userProfile.friends?.includes(r.uid) ? <div style={{color:"#22c55e",fontSize:12,fontWeight:600}}>✓ Friends</div> :
+                <button onClick={() => addFriend(r.uid)} style={{...S.btn,background:"#22c55e",color:"#fff",padding:"8px 16px",borderRadius:10,fontSize:13,fontWeight:600}}>Add</button>}
             </div>
-          )}
+          ))}
         </div>
         {/* Invite link */}
         <div style={{marginBottom:24}}>
@@ -774,7 +843,7 @@ export default function RivalApp() {
               <button onClick={() => startConversation(f.uid)} style={{...S.btn,background:"rgba(213,0,0,0.1)",color:"#FF1744",padding:"6px 14px",borderRadius:8,fontSize:12,fontWeight:600}}>Chat</button>
             </div>
           ))}
-          {friends.length === 0 && <div style={{textAlign:"center",padding:24,color:"#475569",fontSize:13}}>No friends yet. Search by email or share your invite link!</div>}
+          {friends.length === 0 && <div style={{textAlign:"center",padding:24,color:"#475569",fontSize:13}}>No friends yet. Search by username, email, or phone above!</div>}
         </div>
       </div>
     </div>
@@ -820,7 +889,9 @@ export default function RivalApp() {
         <div style={{textAlign:"center",marginBottom:32}}>
           <div style={{width:80,height:80,borderRadius:40,background:"linear-gradient(135deg,#D50000,#FF1744)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:40,margin:"0 auto 12px"}}>{userProfile?.avatar}</div>
           <h3 style={{margin:"0 0 4px",fontSize:20,fontWeight:700}}>{userProfile?.name}</h3>
-          <p style={{margin:0,color:"#64748b",fontSize:14}}>{authUser?.email}</p>
+          <p style={{margin:0,color:"#FF1744",fontSize:14,fontWeight:600}}>@{userProfile?.username}</p>
+          <p style={{margin:"2px 0 0",color:"#64748b",fontSize:13}}>{authUser?.email}</p>
+          {userProfile?.phone && <p style={{margin:"2px 0 0",color:"#64748b",fontSize:13}}>📱 {userProfile.phone}</p>}
           <p style={{margin:"4px 0 0",color:"#FF1744",fontSize:12,fontFamily:"'Orbitron',sans-serif"}}>Invite code: {userProfile?.inviteCode}</p>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:24}}>
