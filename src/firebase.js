@@ -2,26 +2,14 @@ import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  FIREBASE SETUP — Follow these steps:                        ║
-// ║                                                              ║
-// ║  1. Go to https://console.firebase.google.com               ║
-// ║  2. Click "Create a project" → name it "rival-app"          ║
-// ║  3. Once created, click the web icon (</>) to add a web app ║
-// ║  4. Copy your config values below                           ║
-// ║  5. In the Firebase console sidebar:                        ║
-// ║     • Authentication → Sign-in method → Enable Email/Pass   ║
-// ║     • Firestore Database → Create database → Start in       ║
-// ║       test mode (we'll lock it down later)                  ║
-// ╚══════════════════════════════════════════════════════════════╝
-
 const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT.appspot.com",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID"
+  apiKey: "AIzaSyD3HyaLn7vjON8z_ferBJK1IBET4O4CAVw",
+  authDomain: "rival-27027.firebaseapp.com",
+  projectId: "rival-27027",
+  storageBucket: "rival-27027.firebasestorage.app",
+  messagingSenderId: "1754548006",
+  appId: "1:1754548006:web:fa2802adc6089697d8a3e7",
+  measurementId: "G-HSY6JHNXQZ"
 };
 
 const app = initializeApp(firebaseConfig);
