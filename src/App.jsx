@@ -404,13 +404,34 @@ export default function RivalApp() {
     const unsub = onAuthStateChanged(auth, async (user) => {
       setAuthUser(user);
       if (user) {
-        const userDoc = await getDoc(doc(db, "users", user.uid));
-        if (userDoc.exists()) {
-          setUserProfile({ uid: user.uid, ...userDoc.data() });
-          // Set online
-          await updateDoc(doc(db, "users", user.uid), { status: "online", lastSeen: serverTimestamp() });
+        try {
+          const userDocRef = doc(db, "users", user.uid);
+          const userDoc = await getDoc(userDocRef);
+          if (userDoc.exists()) {
+            setUserProfile({ uid: user.uid, ...userDoc.data() });
+            try { await updateDoc(userDocRef, { status: "online", lastSeen: serverTimestamp() }); } catch(e) { console.log("Status update failed:", e); }
+          } else {
+            // Profile doc missing (signup failed halfway) - create it now
+            const fallbackProfile = {
+              name: user.email?.split("@")[0] || "Player",
+              username: user.email?.split("@")[0] || "player" + Date.now(),
+              usernameLower: (user.email?.split("@")[0] || "player" + Date.now()).toLowerCase(),
+              email: user.email || "",
+              phone: "",
+              avatar: "⚡",
+              status: "online",
+              friends: [],
+              createdAt: serverTimestamp(),
+              inviteCode: generateInviteCode()
+            };
+            await setDoc(userDocRef, fallbackProfile);
+            setUserProfile({ uid: user.uid, ...fallbackProfile });
+          }
+          setScreen("home");
+        } catch(e) {
+          console.error("Auth listener error:", e);
+          setScreen("home");
         }
-        setScreen("home");
       } else {
         setUserProfile(null);
         setScreen("login");
@@ -427,6 +448,16 @@ export default function RivalApp() {
     const unsub = onSnapshot(q, (snap) => {
       const convos = snap.docs.map(d => ({ id: d.id, ...d.data() }));
       setConversations(convos);
+    }, (error) => {
+      console.error("Conversations query error:", error);
+      // If index not created yet, try without ordering
+      if (error.code === "failed-precondition") {
+        const q2 = query(collection(db, "conversations"), where("participants", "array-contains", authUser.uid));
+        onSnapshot(q2, (snap) => {
+          const convos = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          setConversations(convos);
+        });
+      }
     });
     return () => unsub();
   }, [authUser]);
@@ -437,11 +468,27 @@ export default function RivalApp() {
     const q = query(collection(db, "conversations", activeConvoId, "messages"), orderBy("timestamp", "asc"), limit(200));
     const unsub = onSnapshot(q, (snap) => {
       setMessages(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (error) => {
+      console.error("Messages query error:", error);
+      // Fallback without ordering
+      const q2 = query(collection(db, "conversations", activeConvoId, "messages"), limit(200));
+      onSnapshot(q2, (snap) => { setMessages(snap.docs.map(d => ({ id: d.id, ...d.data() }))); });
     });
     return () => unsub();
   }, [activeConvoId]);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+
+  // ─── Listen to own profile for real-time friend updates ───
+  useEffect(() => {
+    if (!authUser) return;
+    const unsub = onSnapshot(doc(db, "users", authUser.uid), (snap) => {
+      if (snap.exists()) {
+        setUserProfile(prev => ({ uid: authUser.uid, ...snap.data() }));
+      }
+    }, (error) => { console.log("Profile listener error:", error); });
+    return () => unsub();
+  }, [authUser]);
 
   // ─── Load friends ───
   useEffect(() => {
@@ -449,13 +496,15 @@ export default function RivalApp() {
     const loadFriends = async () => {
       const fList = [];
       for (const fid of userProfile.friends) {
-        const fDoc = await getDoc(doc(db, "users", fid));
-        if (fDoc.exists()) fList.push({ uid: fid, ...fDoc.data() });
+        try {
+          const fDoc = await getDoc(doc(db, "users", fid));
+          if (fDoc.exists()) fList.push({ uid: fid, ...fDoc.data() });
+        } catch(e) { console.log("Failed to load friend:", fid); }
       }
       setFriends(fList);
     };
     loadFriends();
-  }, [userProfile?.friends]);
+  }, [userProfile?.friends?.length]);
 
   // ─── Load notifications (game invites, friend requests) ───
   useEffect(() => {
@@ -463,6 +512,12 @@ export default function RivalApp() {
     const q = query(collection(db, "notifications"), where("to", "==", authUser.uid), orderBy("createdAt", "desc"), limit(30));
     const unsub = onSnapshot(q, (snap) => {
       setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (error) => {
+      console.error("Notifications query error:", error);
+      if (error.code === "failed-precondition") {
+        const q2 = query(collection(db, "notifications"), where("to", "==", authUser.uid));
+        onSnapshot(q2, (snap) => { setNotifications(snap.docs.map(d => ({ id: d.id, ...d.data() }))); });
+      }
     });
     return () => unsub();
   }, [authUser]);
@@ -675,9 +730,21 @@ export default function RivalApp() {
   };
 
   // ─── Helper to get other user in convo ───
+  const [userCache, setUserCache] = useState({});
   const getConvoPartner = (convo) => {
     const otherId = convo.participants.find(p => p !== authUser?.uid);
-    return friends.find(f => f.uid === otherId) || { name: "Unknown", avatar: "👤", status: "offline" };
+    const fromFriends = friends.find(f => f.uid === otherId);
+    if (fromFriends) return fromFriends;
+    if (userCache[otherId]) return userCache[otherId];
+    // Async lookup - will re-render when cache updates
+    if (otherId && !userCache[otherId]) {
+      getDoc(doc(db, "users", otherId)).then(snap => {
+        if (snap.exists()) {
+          setUserCache(prev => ({ ...prev, [otherId]: { uid: otherId, ...snap.data() } }));
+        }
+      }).catch(() => {});
+    }
+    return { name: "Loading...", avatar: "👤", status: "offline", uid: otherId };
   };
 
   const unreadCount = notifications.filter(n => !n.read).length;
