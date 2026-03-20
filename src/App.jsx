@@ -471,13 +471,22 @@ export default function RivalApp() {
   const handleSignup = async () => {
     setAuthError("");
     if (!signupForm.username.trim()) { setAuthError("Username is required"); return; }
+    if (!signupForm.email.trim()) { setAuthError("Email is required"); return; }
+    if (signupForm.password.length < 6) { setAuthError("Password must be at least 6 characters"); return; }
     try {
-      // Check username uniqueness
+      // Create auth account first (this authenticates the user)
+      const cred = await createUserWithEmailAndPassword(auth, signupForm.email, signupForm.password);
+
+      // Now check username uniqueness (user is authenticated so Firestore allows the query)
       const usernameQ = query(collection(db, "users"), where("usernameLower", "==", signupForm.username.toLowerCase().trim()));
       const usernameSnap = await getDocs(usernameQ);
-      if (!usernameSnap.empty) { setAuthError("Username already taken. Try another one."); return; }
+      if (!usernameSnap.empty) {
+        // Username taken - delete the auth account we just created
+        await cred.user.delete();
+        setAuthError("Username already taken. Try another one.");
+        return;
+      }
 
-      const cred = await createUserWithEmailAndPassword(auth, signupForm.email, signupForm.password);
       const myInviteCode = generateInviteCode();
       await setDoc(doc(db, "users", cred.user.uid), {
         name: signupForm.name || signupForm.username,
@@ -498,18 +507,14 @@ export default function RivalApp() {
         const inviterSnap = await getDocs(inviterQ);
         if (!inviterSnap.empty) {
           const inviterUid = inviterSnap.docs[0].id;
-          const inviterData = inviterSnap.docs[0].data();
-          // Add each other as friends
           await updateDoc(doc(db, "users", cred.user.uid), { friends: arrayUnion(inviterUid) });
           await updateDoc(doc(db, "users", inviterUid), { friends: arrayUnion(cred.user.uid) });
-          // Notify the inviter
           await addDoc(collection(db, "notifications"), {
             to: inviterUid, from: cred.user.uid, fromName: signupForm.name || signupForm.username,
             type: "friend_added", text: `${signupForm.name || signupForm.username} joined from your invite link!`,
             read: false, createdAt: serverTimestamp()
           });
         }
-        // Clear invite from URL
         window.history.replaceState({}, "", window.location.pathname);
       }
     } catch (e) { setAuthError(e.message.replace("Firebase: ", "")); }
